@@ -5,7 +5,7 @@ from numpy import random
 
 class readout_simulation:
 
-    def __init__(self, b_in, freq_mm, chi, kappa, alpha_0, t_sim, dt):
+    def __init__(self, b_in, freq_mm, chi, kappa, T1e, T1g, alpha_0, t_sim, dt):
 
         # Takes a function of t representing the baseband signal being sent to the 
         # cavity. Its magnitude is proportional to the square root of photon flux.
@@ -21,6 +21,12 @@ class readout_simulation:
         # Coupling between resonator and transmission line (Hz)
         self.kappa = kappa
 
+        # Characteristic time of e -> g transmon transition 
+        self.T1e = T1e
+
+        # Characteristic time of g -> e transmon transition 
+        self.T1g = T1g
+
         # Initial state of the cavity (coherent state amplitude)
         self.alpha_0 = alpha_0
 
@@ -29,9 +35,6 @@ class readout_simulation:
         
         # Simulation timestep (s)
         self.dt = dt
-        
-        # Arrays of output signal and cavity state at each simulation step, stored in t_rng
-        self.b_out, self.cavity_alpha, self.t_rng = self.simulate_cavity_dynamics()
 
         # Theoretical expected values of measured phase theta of the reflected wave
         # when the transmon is in the ground or excited state (degrees). Assumes b_in is a 
@@ -46,41 +49,44 @@ class readout_simulation:
 
         return (1j*(-1)**q_state*self.chi/2 - self.kappa/2)*alpha - 1j*self.kappa**0.5*self.b_in(t)
 
-    def simulate_cavity_dynamics(self):
+    def simulate_cavity_dynamics(self, q_state):
         '''
-        This function takes the design parameters of the system and simulate the dynamics 
-        of the cavity state alpha as a function of time.
-        Outputs:
-        ::b_out:: Dictionary containing output signal for when the transmon is in the ground
-                state (key = 'g') and in the excited state (key = 'e').
-        ::cavity_alpha:: Dictionary similar to b_out containing the state-dependent cavity state.
-        ::t_rng:: Simulation timestap (s) corresponding to b_out and cavity_alpha values.
+        This function runs a single readout including the simulation of system's dynamics, 
+        digital signal processing and theta estimation. However, it assumes an initial value of the qubit
+        and also allows for a finite relaxation rate as defined by T1g and T1e.
         '''
 
         Ndt = int(self.t_sim/self.dt) + 1
-        t_rng = [x for x in np.linspace(0, self.t_sim, Ndt)]    # Time in microseconds
 
-        b_out = {}
-        cavity_alpha = {}
-        for q_state in [0, 1]:
-            out_key = 'e' if q_state else 'g'
-                
+        halt_simulation = False
+        alpha_t = self.alpha_0
+        flip_prob_per_step = self.dt/(self.T1e if q_state else self.T1g)
+        t_rng = [0.]
+        cavity_alpha = [self.alpha_0]
+
+        while not halt_simulation:
+
             rg = ode(self.resonator_EOM)
-            rg.set_integrator('zvode', method = 'bdf').set_initial_value(self.alpha_0, 0).set_f_params(q_state)
-            alpha_val = []
+            rg.set_integrator('zvode', method = 'bdf').set_initial_value(cavity_alpha[-1], t_rng[-1]).set_f_params(q_state)
+            alpha_list = []
+
             while rg.successful() and rg.t < self.t_sim:
-                alpha_val.append(rg.integrate(rg.t + self.dt))
+                t_rng.append(rg.t + self.dt)
+                cavity_alpha.append(rg.integrate(rg.t + self.dt))
+                if random.random() < flip_prob_per_step:
+                    q_state = 0 if q_state else 1
+                    flip_prob_per_step = self.dt/(self.T1e if q_state else self.T1g)
+                    break
+        
+            # Checks if simulation is complete
+            if rg.t >= self.t_sim:
+                halt_simulation = True
 
-            cavity_alpha[out_key] = alpha_val
-            b_out[out_key] = [-1j*self.kappa**0.5*alpha_val[x] + self.b_in(self.dt*x) for x in range(len(alpha_val))]
-
-        self.b_out = b_out
-        self.cavity_alpha = cavity_alpha
-        self.t_rng = t_rng
+        b_out = [-1j*self.kappa**0.5*cavity_alpha[i] + self.b_in(t_rng[i]) for i in range(len(t_rng))]
 
         return b_out, cavity_alpha, t_rng
 
-    def b_signal_proc(self, t_wait, t_acq, dt_acq): 
+    def digital_signal_processing(self, b_out, t_rng, t_wait, t_acq, dt_acq): 
         '''
         Simulates the acquisition of b_out and remove the frequency mismatch.
         Inputs:
@@ -90,86 +96,93 @@ class readout_simulation:
         Outputs:
         ::acq_b_out:: Dictionary containing the digitalized output signal for each acquisition. 
                       The ground (excited) state is stored in key = 'g' ('e').
-        ::proc_b_out:: Dictionary containing the digitalized output signal for each acquisition
+        ::dsp_b_out:: Dictionary containing the digitalized output signal for each acquisition
                        step after the frequency mismatch is removed. The ground (excited) state
                        is stored in key = 'g' ('e').
         ::acq_time:: Acquisition timestamps (s).
         '''
 
         Nt_acq = round(t_acq/dt_acq)    # number of samples
-        t_rng = self.t_rng
-
         dindex = round(dt_acq/self.dt)
 
         # Collecting samples from the output signal
         start_index = t_rng.index(sorted(t_rng, key = lambda x: (t_wait - x)**2)[0])
         end_index = t_rng.index(sorted(t_rng, key = lambda x: ((t_wait + t_acq) - x)**2)[0])
 
-        acq_b_out = {'g': [], 'e': []}
+        acq_b_out = []
         acq_time = []
         for n in range(Nt_acq):
             sampling_index = start_index + n*dindex
-            acq_b_out['e'].append(self.b_out['e'][sampling_index])
-            acq_b_out['g'].append(self.b_out['g'][sampling_index])
+            acq_b_out.append(b_out[sampling_index])
             acq_time.append(t_rng[sampling_index])
 
-        proc_b_out = {'g': [x*np.exp(-1j*2*np.pi*self.freq_mm*dt_acq*n) 
-                            for n, x in enumerate(acq_b_out['g'])],
-                      'e': [x*np.exp(-1j*2*np.pi*self.freq_mm*dt_acq*n) 
-                            for n, x in enumerate(acq_b_out['e'])]}
+        # Manually removing the frequency mismatch
+        dsp_b_out = [x*np.exp(-1j*2*np.pi*self.freq_mm*dt_acq*n) 
+                            for n, x in enumerate(acq_b_out)]
 
+        # Adding quantum noise to the acquired data
         noisy_proc_b_out = {}
 
-        # Standard deviation of quadrature components in coherent states
+        # Variance of quadrature component in coherent states
         quad_var = 1/4
 
         # Get random noise
-        noise_array = random.multivariate_normal([0, 0], [[quad_var, 0], [0, quad_var]], size = 2*len(acq_time))
-        noise_e = [x[0] + 1j*x[1] for x in noise_array[:len(acq_time)]]
-        noise_g = [x[0] + 1j*x[1] for x in noise_array[len(acq_time):]]
+        bidimensional_noise_array = random.multivariate_normal([0, 0], [[quad_var, 0], [0, quad_var]], size = len(acq_time))
+        complex_noise_array = [x[0] + 1j*x[1] for x in bidimensional_noise_array]
 
-        noisy_proc_b_out = {'g': [noise_g[i] + proc_b_out['g'][i] for i in range(len(proc_b_out['g']))],
-                            'e': [noise_e[i] + proc_b_out['e'][i] for i in range(len(proc_b_out['e']))]}
+        noisy_dsp_b_out = [complex_noise_array[i] + dsp_b_out[i] for i in range(len(dsp_b_out))]
 
-        return acq_b_out, proc_b_out, noisy_proc_b_out, acq_time
+        return acq_b_out, dsp_b_out, noisy_dsp_b_out, acq_time
 
 
-    def theta_estimation(self, noisy_proc_b_out, dt_acq): 
+    def theta_estimation(self, noisy_dsp_b_out, dt_acq): 
         '''
         Extracts theta estimation for the whole readout for ground and excited state.
-        ::noisy_proc_b_out:: noisy post-processed data measured from b_out as defined in b_signal_proc.
-        ::dt_acq:: Acquisition interval (s). Same as defined for b_signal_proc.
+        ::noisy_proc_b_out:: noisy post-processed data measured from b_out as defined in digital_signal_processing.
+        ::dt_acq:: Acquisition interval (s). Same as defined for digital_signal_processing.
         Outputs:
         ::theta_out:: Dictionary containing the each measurement of theta. 
                       The ground (excited) state is stored in key = 'g' ('e').
         ::acq_time:: Timestamps for each theta measurement (s).
         '''
 
-        theta_out = {'g': [float(np.angle(x, deg = True)) for x in noisy_proc_b_out['g']],
-                     'e': [float(np.angle(x, deg = True)) for x in noisy_proc_b_out['e']]}
-
         # The phase estimation is made by integrating the values of theta in time
         def integrate_theta(noisy_theta, N = -1):
-            
             if N == -1:
                 int_theta = dt_acq*sum(noisy_theta)
             else:
                 int_theta = dt_acq*sum(noisy_theta[0:N])
             return int_theta
 
-        int_theta_out = {'g': [integrate_theta(theta_out['g'], N = i) for i in range(len(theta_out['g']))],
-                         'e': [integrate_theta(theta_out['e'], N = i) for i in range(len(theta_out['e']))]}
+        acq_time = [i*dt_acq for i in range(len(noisy_dsp_b_out))]
 
-        theta_estimate = {'g': int_theta_out['g'][-1]/(dt_acq*len(int_theta_out['g'])),
-                          'e': int_theta_out['e'][-1]/(dt_acq*len(int_theta_out['e']))}
+        theta_out = [float(np.angle(x, deg = True)) for x in noisy_dsp_b_out]
 
-        acq_time = [i*dt_acq for i in range(len(noisy_proc_b_out['g']))]
+        int_theta_out = [integrate_theta(theta_out, N = i) for i in range(len(theta_out) + 1)]
 
-        return theta_out, int_theta_out, theta_estimate, acq_time
+        theta_estimate = [int_theta_out[i]/dt_acq/i for i in range(1, len(int_theta_out))]
 
-    #def do_readout
+        est_q_state = [0 if abs(self.exp_theta['g'] - th) < abs(self.exp_theta['e'] - th) else 1
+                       for th in theta_estimate]
 
-    def do_multiple_readouts(self, N, t_wait, t_acq, dt_acq): 
+        return theta_out, int_theta_out, theta_estimate, est_q_state, acq_time
+
+    def do_readout(self, q_state, t_wait, t_acq, dt_acq):
+        '''
+        '''
+
+        # Simulate the system's dynamics
+        b_out, cavity_alpha, t_rng = self.simulate_cavity_dynamics(q_state)
+
+        # Does the acquisition and DSP of the received signal
+        acq_b_out, dsp_b_out, noisy_dsp_b_out, acq_time = self.digital_signal_processing(b_out, t_rng, t_wait, t_acq, dt_acq)
+
+        # Estimates the value of theta
+        theta_out, int_theta_out, theta_estimate, est_q_state, acq_time = self.theta_estimation(noisy_dsp_b_out, dt_acq)
+
+        return theta_out, int_theta_out, theta_estimate, est_q_state, acq_time
+
+    def do_multiple_readouts(self, q_state, N, t_wait, t_acq, dt_acq): 
         '''
         This function runs readout simulations N times to allow a statistical evaluation of the process.
         It calculates the evolution of fidelity as a function of the number of acquisition steps.
@@ -177,53 +190,35 @@ class readout_simulation:
 
         Nt_acq = round(t_acq/dt_acq)
         # Separate the data of each acquisition step into a separated array for gaussian fit 
-        acq_steps_data =  {'g': [[] for _ in range(Nt_acq)], 'e': [[] for _ in range(Nt_acq)]}
+        acq_steps_data =  [[] for _ in range(Nt_acq + 1)]
+        est_q_state_steps =  [[] for _ in range(Nt_acq)] 
         
-        # Save the integrated theta meas. data for each of the N runs in a dictionary indexed by transmon state
-        int_theta_data = {'g': [], 'e': []}
+        # Save the integrated theta measurement  
+        int_theta_data = []
 
-        # Do readout N times to account for the noise
+        # Do readout N times to account for the noise and qubit flips
         for n in range(N):
             # Run readout
-            acq_b_out, proc_b_out, noisy_proc_b_out, acq_time = self.b_signal_proc(t_wait, t_acq, dt_acq)
-            theta_out, int_theta_out, theta_estimate, acq_time = self.theta_estimation(noisy_proc_b_out, dt_acq)
+            b_out, cavity_alpha, t_rng = self.simulate_cavity_dynamics(q_state)
+            acq_b_out, dsp_b_out, noisy_dsp_b_out, acq_time = self.digital_signal_processing(b_out, t_rng, t_wait, t_acq, dt_acq)
+            theta_out, int_theta_out, theta_estimate, est_q_state, acq_time = self.theta_estimation(noisy_dsp_b_out, dt_acq)
             
             # Save the data
-            int_theta_data['g'].append(int_theta_out['g'])
-            int_theta_data['e'].append(int_theta_out['e'])
-            for k in range(len(int_theta_out['e'])):
-                acq_steps_data['g'][k].append(int_theta_out['g'][k])
-                acq_steps_data['e'][k].append(int_theta_out['e'][k])
-
-        acq_N = len(acq_time)
+            int_theta_data.append(int_theta_out)
+            for k in range(len(int_theta_out)):
+                acq_steps_data[k].append(int_theta_out[k])
+            for k in range(len(est_q_state)):
+                est_q_state_steps[k].append(est_q_state[k])
 
         # Make a gaussian fit for each step in acq_steps_data
-        gaussian_fit = {'g':[], 'e':[]}
-        for n in range(len(acq_steps_data['e'])):
-            gaussian_fit['g'].append(norm.fit(acq_steps_data['g'][n]))
-            gaussian_fit['e'].append(norm.fit(acq_steps_data['e'][n]))
-            
-        # Define the theoretical boundaries for state discrimination
-        theta_bound = (self.exp_theta['g'] + self.exp_theta['e'])/2   # Theoretical phase discrimination boundary
-        theta_t_bound = [theta_bound*dt_acq*i for i in range(acq_N)]   # theta_bound integrated in acquisition time 
+        gaussian_fit = []
+        for n in range(1, len(acq_steps_data)):
+            gaussian_fit.append(norm.fit(acq_steps_data[n]))
 
-        # Calculate the fidelity matrix of each acquisition step. 
-        fidelity_matrices = []
-        for n in range(1, len(gaussian_fit['g'])):
-            mu_e, std_e = gaussian_fit['e'][n]
-            mu_g, std_g = gaussian_fit['g'][n]
-            gaussian_e = lambda x: norm.pdf(x, mu_e, std_e)
-            gaussian_g = lambda x: norm.pdf(x, mu_g, std_g)
-            
-            if self.exp_theta['e'] > self.exp_theta['g']:
-                err_e = quad(gaussian_e, -100*std_e, theta_t_bound[n])[0]
-                err_g = quad(gaussian_g, theta_t_bound[n], 100*std_g)[0]
-                    
-            if self.exp_theta['e'] < self.exp_theta['g']:
-                err_g = quad(gaussian_g, -100*std_g, theta_bound_t[n])[0]
-                err_e = quad(gaussian_e, theta_t_bound[n], 100*std_e)[0]
-            
-            fidelity_matrices.append([[1-err_e, err_e],[err_g, 1-err_g]])
+        # Estimate the error rate by acquisition step by counting readout failures. 
+        error_rate = []
+        for est_q_state in est_q_state_steps:
+            error_rate.append(1 - est_q_state.count(q_state)/len(est_q_state))
 
-        return int_theta_data, acq_steps_data, gaussian_fit, fidelity_matrices, acq_time
+        return int_theta_data, acq_steps_data, gaussian_fit, error_rate, acq_time
 
