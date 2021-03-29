@@ -167,6 +167,54 @@ class readout_simulation:
 
         return theta_out, int_theta_out, theta_estimate, est_q_state, acq_time
 
+        
+    def state_estimation(self, noisy_dsp_b_out, dt_acq): 
+        '''
+        Extracts state estimation for the whole readout for ground and excited state.
+        The difference between theta_estimation and state_estimation is that the latter
+        does state differentiation based on the signal IQ values projected onto the separatrix
+        instead of its angle.
+        Inputs:
+        ::noisy_proc_b_out:: noisy post-processed data measured from b_out as defined in digital_signal_processing.
+        ::dt_acq:: Acquisition interval (s). Same as defined for digital_signal_processing.
+        Outputs:
+        ::signal_out:: Dictionary containing the each measurement of output signal. 
+                       The ground (excited) state is stored in key = 'g' ('e').
+        ::acq_time:: Timestamps for each signal measurement (s).
+        '''
+
+        # Integrates signal in time
+        def integrate_signal(noisy_signal, N = -1):
+            if N == -1:
+                int_signal = dt_acq*sum(noisy_signal)
+            else:
+                int_signal = dt_acq*sum(noisy_signal[0:N])
+            return int_signal
+
+        acq_time = [i*dt_acq for i in range(len(noisy_dsp_b_out))]
+
+        # Define theoretically determined separatrix
+        theta_e, theta_g = self.exp_theta['e'], self.exp_theta['g']
+        exp_e = np.exp(1j*np.pi*theta_e/180)
+        exp_g = np.exp(1j*np.pi*theta_g/180)
+        separatrix = 1j*(exp_e + exp_g)/np.absolute(exp_e + exp_g)
+        separatrix /= np.absolute(separatrix)
+        proj_exp_g = (exp_g.real*separatrix.real + exp_g.imag*separatrix.imag)
+        proj_exp_e = (exp_e.real*separatrix.real + exp_e.imag*separatrix.imag)
+
+        # Project noisy post-processed signal onto separatrix to get maximum state distinction
+        signal_out = [(x.real*separatrix.real + x.imag*separatrix.imag)[0] for x in noisy_dsp_b_out]
+
+        # Integrate signal
+        int_signal_out = [integrate_signal(signal_out, N = i) for i in range(len(signal_out) + 1)]
+
+        signal_estimate = [int_signal_out[i]/dt_acq/i for i in range(1, len(int_signal_out))]
+
+        est_q_state = [0 if abs(proj_exp_g - sn) < abs(proj_exp_e - sn) else 1
+                       for sn in signal_estimate]
+
+        return signal_out, int_signal_out, signal_estimate, est_q_state, acq_time
+
     def do_readout(self, q_state, t_wait, t_acq, dt_acq):
         '''
         '''
@@ -193,20 +241,20 @@ class readout_simulation:
         acq_steps_data =  [[] for _ in range(Nt_acq + 1)]
         est_q_state_steps =  [[] for _ in range(Nt_acq)] 
         
-        # Save the integrated theta measurement  
-        int_theta_data = []
+        # Save the integrated signal measurement  
+        int_signal_data = []
 
         # Do readout N times to account for the noise and qubit flips
         for n in range(N):
             # Run readout
             b_out, cavity_alpha, t_rng = self.simulate_cavity_dynamics(q_state)
             acq_b_out, dsp_b_out, noisy_dsp_b_out, acq_time = self.digital_signal_processing(b_out, t_rng, t_wait, t_acq, dt_acq)
-            theta_out, int_theta_out, theta_estimate, est_q_state, acq_time = self.theta_estimation(noisy_dsp_b_out, dt_acq)
+            signal_out, int_signal_out, signal_estimate, est_q_state, acq_time = self.state_estimation(noisy_dsp_b_out, dt_acq)
             
             # Save the data
-            int_theta_data.append(int_theta_out)
-            for k in range(len(int_theta_out)):
-                acq_steps_data[k].append(int_theta_out[k])
+            int_signal_data.append(int_signal_out)
+            for k in range(len(int_signal_out)):
+                acq_steps_data[k].append(int_signal_out[k])
             for k in range(len(est_q_state)):
                 est_q_state_steps[k].append(est_q_state[k])
 
@@ -220,5 +268,5 @@ class readout_simulation:
         for est_q_state in est_q_state_steps:
             error_rate.append(1 - est_q_state.count(q_state)/len(est_q_state))
 
-        return int_theta_data, acq_steps_data, gaussian_fit, error_rate, acq_time
+        return int_signal_data, acq_steps_data, gaussian_fit, error_rate, acq_time
 
